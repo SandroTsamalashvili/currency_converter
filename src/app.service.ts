@@ -1,4 +1,13 @@
-import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  HttpException,
+  HttpStatus,
+  Logger,
+  Inject,
+} from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
+import { ConfigService } from '@nestjs/config';
 import {
   CurrencyApiService,
   MonobankRate,
@@ -6,11 +15,20 @@ import {
 import { ConvertResponseDto } from './dto/convert.dto';
 import { UAH_CODE } from './constants/currency-codes';
 
+const CONVERSION_CACHE_PREFIX = 'conversion';
+
 @Injectable()
 export class AppService {
   private readonly logger = new Logger(AppService.name);
+  private readonly conversionCacheTtl: number;
 
-  constructor(private readonly currencyApiService: CurrencyApiService) {}
+  constructor(
+    private readonly currencyApiService: CurrencyApiService,
+    private readonly configService: ConfigService,
+    @Inject(CACHE_MANAGER) private cacheManager: Cache,
+  ) {
+    this.conversionCacheTtl = this.configService.get<number>('CACHE_TTL', 300);
+  }
 
   async convert(
     from: string,
@@ -29,17 +47,30 @@ export class AppService {
 
     if (!fromCode) {
       throw new HttpException(
-        `Unsupported currency: ${from}. Supported: ${this.currencyApiService.getSupportedCurrencies().join(', ')}`,
+        `Unsupported currency: ${from}.}`,
         HttpStatus.BAD_REQUEST,
       );
     }
 
     if (!toCode) {
       throw new HttpException(
-        `Unsupported currency: ${to}. Supported: ${this.currencyApiService.getSupportedCurrencies().join(', ')}`,
+        `Unsupported currency: ${to}.}`,
         HttpStatus.BAD_REQUEST,
       );
     }
+
+    // Check cache for conversion result
+    const cacheKey = this.getConversionCacheKey(from, to, amount);
+
+    const cachedResult =
+      await this.cacheManager.get<ConvertResponseDto>(cacheKey);
+
+    if (cachedResult) {
+      this.logger.debug(`Conversion cache HIT for ${amount} ${from} -> ${to}`);
+      return cachedResult;
+    }
+
+    this.logger.debug(`Conversion cache MISS for ${amount} ${from} -> ${to}`);
 
     const rates = await this.currencyApiService.getExchangeRates();
 
@@ -58,12 +89,29 @@ export class AppService {
       `Converted ${amount} ${from} to ${result.toFixed(4)} ${to} (rate: ${rate.rateBuy || rate.rateCross})`,
     );
 
-    return {
+    const response: ConvertResponseDto = {
       from: from.toUpperCase(),
       to: to.toUpperCase(),
       amount,
       result: Number(result.toFixed(4)),
     };
+
+    // Cache the conversion result
+    await this.cacheManager.set(
+      cacheKey,
+      response,
+      this.conversionCacheTtl * 1000,
+    );
+
+    return response;
+  }
+
+  private getConversionCacheKey(
+    from: string,
+    to: string,
+    amount: number,
+  ): string {
+    return `${CONVERSION_CACHE_PREFIX}:${from.toUpperCase()}:${to.toUpperCase()}:${amount}`;
   }
 
   private findRate(
@@ -116,14 +164,42 @@ export class AppService {
     toCode: number,
   ): number {
     if (toCode === UAH_CODE) {
-      return amount * (rate.rateBuy || rate.rateCross || 1);
+      return amount * this.getRequiredRate(rate, 'buy');
     }
 
     if (fromCode === UAH_CODE) {
-      return amount / (rate.rateSell || rate.rateCross || 1);
+      return amount / this.getRequiredRate(rate, 'sell');
     }
 
-    return amount * (rate.rateCross || 1);
+    return amount * this.getRequiredRate(rate, 'cross');
+  }
+
+  private getRequiredRate(
+    rate: MonobankRate,
+    type: 'buy' | 'sell' | 'cross',
+  ): number {
+    let value: number | undefined;
+
+    if (type === 'buy') {
+      value = rate.rateBuy ?? rate.rateCross;
+    }
+
+    if (type === 'sell') {
+      value = rate.rateSell ?? rate.rateCross;
+    }
+
+    if (type === 'cross') {
+      value = rate.rateCross;
+    }
+
+    if (!value) {
+      throw new HttpException(
+        `Incomplete exchange rate data.`,
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+
+    return value;
   }
 
   getSupportedCurrencies(): string[] {
@@ -131,6 +207,11 @@ export class AppService {
   }
 
   async invalidateCache(): Promise<void> {
+    // Clear conversion cache by resetting the cache store
+    await (this.cacheManager as Cache & { reset: () => Promise<void> }).reset();
+    this.logger.debug('Conversion cache invalidated');
+
+    // Invalidate the rates cache
     await this.currencyApiService.invalidateCache();
   }
 }

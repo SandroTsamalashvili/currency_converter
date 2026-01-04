@@ -34,7 +34,6 @@ import { CurrencyModule } from './currency/currency.module';
       },
     }),
 
-    // Currency module for API calls
     CurrencyModule,
   ],
   controllers: [AppController],

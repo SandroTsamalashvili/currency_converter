@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { HttpException, HttpStatus } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { ConfigService } from '@nestjs/config';
 import { AppService } from './app.service';
 import {
   CurrencyApiService,
@@ -9,6 +11,7 @@ import {
 describe('AppService', () => {
   let service: AppService;
   let currencyApiService: jest.Mocked<CurrencyApiService>;
+  let cacheManager: { get: jest.Mock; set: jest.Mock; reset: jest.Mock };
 
   const mockRates: MonobankRate[] = [
     {
@@ -41,6 +44,12 @@ describe('AppService', () => {
   ];
 
   beforeEach(async () => {
+    cacheManager = {
+      get: jest.fn().mockResolvedValue(null),
+      set: jest.fn().mockResolvedValue(undefined),
+      reset: jest.fn().mockResolvedValue(undefined),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AppService,
@@ -51,6 +60,16 @@ describe('AppService', () => {
             getCurrencyCode: jest.fn(),
             getSupportedCurrencies: jest.fn(),
             invalidateCache: jest.fn(),
+          },
+        },
+        {
+          provide: CACHE_MANAGER,
+          useValue: cacheManager,
+        },
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn().mockReturnValue(300),
           },
         },
       ],
@@ -304,6 +323,34 @@ describe('AppService', () => {
       await expect(service.convert('USD', 'UAH', 100)).rejects.toMatchObject({
         status: HttpStatus.NOT_FOUND,
       });
+    });
+  });
+
+  describe('Conversion Caching', () => {
+    it('should cache conversion results', async () => {
+      await service.convert('USD', 'UAH', 100);
+
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'conversion:USD:UAH:100',
+        expect.objectContaining({
+          from: 'USD',
+          to: 'UAH',
+          amount: 100,
+          result: 3750.0,
+        }),
+        300000,
+      );
+    });
+
+    it('should use correct cache key format', async () => {
+      await service.convert('eur', 'uah', 50.5);
+
+      expect(cacheManager.get).toHaveBeenCalledWith('conversion:EUR:UAH:50.5');
+      expect(cacheManager.set).toHaveBeenCalledWith(
+        'conversion:EUR:UAH:50.5',
+        expect.any(Object),
+        300000,
+      );
     });
   });
 });
